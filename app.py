@@ -172,7 +172,7 @@ def load_data():
         df["dataset"] = label
         # Parse first_seen_date
         df["first_seen_date"] = pd.to_datetime(df["first_seen_date"], utc=True, errors="coerce")
-        df["first_seen_month"] = df["first_seen_date"].dt.to_period("M").astype(str)
+        df["first_seen_month"] = df["first_seen_date"].dt.tz_localize(None).dt.to_period("M").astype(str)
         df["first_seen_year"]  = df["first_seen_date"].dt.year
         # Parse date_posted — handles Unix timestamps (seconds) and MM/DD/YYYY strings
         def parse_date_posted(series):
@@ -447,16 +447,20 @@ with tab_timeseries:
             df_ts["date_val"] = pd.to_datetime(df_ts["date_val"], utc=True, errors="coerce")
             df_ts = df_ts.dropna(subset=["date_val"])
 
+            # Strip timezone before to_period() to avoid pandas UserWarning
+            df_ts["date_val_naive"] = df_ts["date_val"].dt.tz_localize(None) \
+                if df_ts["date_val"].dt.tz is None else df_ts["date_val"].dt.tz_convert(None)
+
             if ts_granularity == "Daily":
-                df_ts["period"] = df_ts["date_val"].dt.to_period("D").apply(lambda p: p.start_time)
+                df_ts["period"] = df_ts["date_val_naive"].dt.to_period("D").apply(lambda p: p.start_time)
                 fill_freq = "D"
                 tick_fmt  = "%b %d, %Y"
             elif ts_granularity == "Weekly":
-                df_ts["period"] = df_ts["date_val"].dt.to_period("W").apply(lambda p: p.start_time)
+                df_ts["period"] = df_ts["date_val_naive"].dt.to_period("W").apply(lambda p: p.start_time)
                 fill_freq = "W-MON"
                 tick_fmt  = "%b %d, %Y"
             else:
-                df_ts["period"] = df_ts["date_val"].dt.to_period("M").apply(lambda p: p.start_time)
+                df_ts["period"] = df_ts["date_val_naive"].dt.to_period("M").apply(lambda p: p.start_time)
                 fill_freq = "MS"
                 tick_fmt  = "%b %Y"
 
