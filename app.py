@@ -553,32 +553,39 @@ with tab_timeseries:
             min_date    = bound_dates.min().date()
             max_date    = bound_dates.max().date()
 
-            # Parse clicked point from chart and push into session_state
-            # so the calendar widget reflects it on the next rerun
+            # Parse clicked point — store in a separate key so it doesn't
+            # conflict with the date_input widget's own state management
             if selected and selected.get("selection") and selected["selection"].get("points"):
                 pt = selected["selection"]["points"][0]
                 raw_x = pt.get("x", "")
                 if raw_x:
                     try:
                         clicked = pd.to_datetime(raw_x).date()
-                        # Clamp to valid range
                         clicked = max(min_date, min(max_date, clicked))
-                        st.session_state["drill_date"] = clicked
+                        # Only update if different from current value to avoid
+                        # infinite rerun loops
+                        if st.session_state.get("drill_date_clicked") != clicked:
+                            st.session_state["drill_date_clicked"] = clicked
+                            st.session_state["drill_date_value"]   = clicked
                     except Exception:
                         pass
 
+            # Use separate value state — lets the user also change it freely
+            # without fighting the chart click
+            current_drill_date = st.session_state.get("drill_date_value", min_date)
+
             drill_col1, drill_col2 = st.columns([2, 3])
             with drill_col1:
-                # date_input reads from session_state["drill_date"] if set
                 drill_date = st.date_input(
                     "Pick a date",
-                    value=st.session_state.get("drill_date", min_date),
+                    value=current_drill_date,
                     min_value=min_date,
                     max_value=max_date,
-                    key="drill_date",
                     label_visibility="collapsed",
                 )
-                if st.session_state.get("drill_date"):
+                # Write user's manual selection back to state
+                st.session_state["drill_date_value"] = drill_date
+                if st.session_state.get("drill_date_clicked") == drill_date:
                     st.caption("📍 Synced from chart click")
             with drill_col2:
                 drill_season = st.multiselect(
