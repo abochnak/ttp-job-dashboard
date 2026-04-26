@@ -403,6 +403,12 @@ with tab_timeseries:
 
     with col_ctrl3:
         ts_granularity = st.radio("Granularity", ["Weekly", "Monthly"], key="ts_granularity")
+        ts_date_field  = st.radio(
+            "Date field",
+            ["Date posted", "First seen in repo"],
+            key="ts_date_field",
+            help="Date posted = when company posted the job. First seen = when our scraper found it.",
+        )
         show_total = st.checkbox("Show total line", value=True, key="ts_show_total")
 
     if not ts_seasons:
@@ -417,17 +423,22 @@ with tab_timeseries:
 
         TOTAL_LABEL = "── Total (all seasons) ──"
 
+        # Choose which date field to group by
+        use_date_posted = (ts_date_field == "Date posted")
+        date_col_label  = "date_posted" if use_date_posted else "first_seen_date"
+        chart_date_label = "date_posted_dt" if use_date_posted else "first_seen_date"
+
         # Per-season rows: one entry per job x season pair
         rows_ts = []
         for _, row in df_ts_src.iterrows():
             for s in str(row["recruiting_season"]).split("|"):
                 s = s.strip()
                 if s and s not in ("N/A", "nan") and s in ts_seasons:
-                    rows_ts.append({"season": s, "first_seen_date": row["first_seen_date"]})
+                    rows_ts.append({"season": s, "date_val": row[chart_date_label]})
 
-        # Total line: every unique job regardless of season (matches Trends tab)
+        # Total line: every unique job regardless of season
         rows_total = [
-            {"season": TOTAL_LABEL, "first_seen_date": row["first_seen_date"]}
+            {"season": TOTAL_LABEL, "date_val": row[chart_date_label]}
             for _, row in df_ts_src.iterrows()
         ]
 
@@ -436,21 +447,26 @@ with tab_timeseries:
         if not all_rows:
             st.warning("No data found for the selected seasons and dataset.")
         else:
+            date_field_note = (
+                "grouped by **date posted** (when the company originally posted the job)"
+                if use_date_posted else
+                "grouped by **first seen date** (when our scraper discovered the job)"
+            )
             st.caption(
-                "Each season line counts jobs whose recruiting season includes that label. "
-                "The **Total** line counts every unique job regardless of season — matching the Trends tab exactly."
+                f"Each season line counts jobs whose recruiting season includes that label, {date_field_note}. "
+                "The **Total** line counts every unique job regardless of season."
             )
 
             df_ts = pd.DataFrame(all_rows)
-            df_ts["first_seen_date"] = pd.to_datetime(df_ts["first_seen_date"], utc=True, errors="coerce")
-            df_ts = df_ts.dropna(subset=["first_seen_date"])
+            df_ts["date_val"] = pd.to_datetime(df_ts["date_val"], utc=True, errors="coerce")
+            df_ts = df_ts.dropna(subset=["date_val"])
 
             if ts_granularity == "Weekly":
-                df_ts["period"] = df_ts["first_seen_date"].dt.to_period("W").apply(lambda p: p.start_time)
+                df_ts["period"] = df_ts["date_val"].dt.to_period("W").apply(lambda p: p.start_time)
                 fill_freq = "W-MON"
                 tick_fmt  = "%b %d, %Y"
             else:
-                df_ts["period"] = df_ts["first_seen_date"].dt.to_period("M").apply(lambda p: p.start_time)
+                df_ts["period"] = df_ts["date_val"].dt.to_period("M").apply(lambda p: p.start_time)
                 fill_freq = "MS"
                 tick_fmt  = "%b %Y"
 
@@ -542,10 +558,11 @@ with tab_timeseries:
             st.markdown("#### Drill-down: jobs posted in a period")
             st.caption("Click a point on the chart, or pick a date in the calendar below")
 
-            # Derive date bounds from date_posted_dt (when companies actually posted)
-            valid_posted = df_ts_src["date_posted_dt"].dropna()
-            min_date = valid_posted.min().date()
-            max_date = valid_posted.max().date()
+            # Calendar bounds match the selected date field
+            bound_col   = "date_posted_dt" if use_date_posted else "first_seen_date"
+            bound_dates = pd.to_datetime(df_ts_src[bound_col], utc=True, errors="coerce").dropna()
+            min_date    = bound_dates.min().date()
+            max_date    = bound_dates.max().date()
 
             # Parse clicked point from chart and push into session_state
             # so the calendar widget reflects it on the next rerun
@@ -584,13 +601,14 @@ with tab_timeseries:
                     label_visibility="collapsed",
                 )
 
-            # Filter source data by date_posted_dt (when the company actually posted)
+            # Filter using the same date field as the chart
             drill_src = df_ts_src.copy()
-            # Normalize date_posted_dt to timezone-naive for safe comparison
-            posted = drill_src["date_posted_dt"]
-            if hasattr(posted.dtype, "tz") and posted.dtype.tz is not None:
-                posted = posted.dt.tz_localize(None)
-            drill_src["_posted_naive"] = posted
+            drill_col = "date_posted_dt" if use_date_posted else "first_seen_date"
+            drill_dates = pd.to_datetime(drill_src[drill_col], utc=True, errors="coerce")
+            # Normalize to timezone-naive for comparison
+            if hasattr(drill_dates.dtype, "tz") and drill_dates.dtype.tz is not None:
+                drill_dates = drill_dates.dt.tz_localize(None)
+            drill_src["_drill_date"] = drill_dates
 
             drill_date_ts = pd.Timestamp(drill_date)  # timezone-naive
 
@@ -598,14 +616,14 @@ with tab_timeseries:
                 week_start = drill_date_ts - pd.Timedelta(days=drill_date_ts.weekday())
                 week_end   = week_start + pd.Timedelta(days=6)
                 drill_result = drill_src[
-                    (drill_src["_posted_naive"] >= week_start) &
-                    (drill_src["_posted_naive"] <= week_end)
+                    (drill_src["_drill_date"] >= week_start) &
+                    (drill_src["_drill_date"] <= week_end)
                 ].copy()
                 period_label = f"week of {week_start.strftime('%b %d, %Y')}"
             else:
                 drill_result = drill_src[
-                    (drill_src["_posted_naive"].dt.year  == drill_date_ts.year) &
-                    (drill_src["_posted_naive"].dt.month == drill_date_ts.month)
+                    (drill_src["_drill_date"].dt.year  == drill_date_ts.year) &
+                    (drill_src["_drill_date"].dt.month == drill_date_ts.month)
                 ].copy()
                 period_label = drill_date_ts.strftime("%B %Y")
 
