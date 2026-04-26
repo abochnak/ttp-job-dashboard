@@ -76,6 +76,10 @@ REM_URL = (
     f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}"
     f"/{BRANCH}/data/remote_jobs.csv"
 )
+EXCLUDE_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}"
+    f"/{BRANCH}/data/excluded_jobs.csv"
+)
 
 # Title patterns to flag as non-undergraduate internships
 FILTER_PATTERNS = {
@@ -89,25 +93,80 @@ NYC_COLOR    = "#f97316"
 REMOTE_COLOR = "#38bdf8"
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)   # refresh every hour
+# Set DEV=1 in your terminal to disable caching locally:
+#   export DEV=1 && streamlit run app.py
+import os
+_cache_ttl = 0 if os.environ.get("DEV") else 300
+@st.cache_data(ttl=_cache_ttl)
 def load_data():
     def fetch(url):
+        df = None
+        fname = "nyc_jobs.csv" if "nyc" in url else "remote_jobs.csv"
+
+        # Try GitHub — use a session with no conditional headers so we always
+        # get a 200 with a body rather than a 304 with an empty body
         try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
+            session = requests.Session()
+            session.headers.update({
+                "Cache-Control": "no-cache, no-store",
+                "Pragma": "no-cache",
+            })
+            r = session.get(url, timeout=15)
+            if r.status_code == 200 and r.text.strip():
+                df = pd.read_csv(io.StringIO(r.text))
+            elif r.status_code == 304:
+                # 304 with no body — force a second request stripping all caching headers
+                r2 = requests.get(url, timeout=15, headers={
+                    "Cache-Control": "no-cache",
+                    "If-None-Match": "",
+                    "If-Modified-Since": "",
+                })
+                if r2.status_code == 200 and r2.text.strip():
+                    df = pd.read_csv(io.StringIO(r2.text))
         except Exception:
-            # Fall back to local files for development
-            fname = "nyc_jobs.csv" if "nyc" in url else "remote_jobs.csv"
-            try:
-                df = pd.read_csv(f"data/{fname}")
-            except FileNotFoundError:
-                st.error(f"Could not load data from {url} or local data/ folder.")
-                st.stop()
+            pass  # fall through to local
+
+        # Fall back to local data/ folder (for local development)
+        if df is None:
+            local_paths = [
+                f"data/{fname}",
+                fname,
+                f"../data/{fname}",
+            ]
+            for path in local_paths:
+                try:
+                    df = pd.read_csv(path)
+                    break
+                except FileNotFoundError:
+                    continue
+
+        if df is None:
+            st.error(
+                f"Could not load data.\n\n"
+                f"**GitHub URL:** {url}\n\n"
+                f"**Local fallback:** place `{fname}` in a `data/` folder next to `app.py`"
+            )
+            st.stop()
         return df
 
     nyc = fetch(NYC_URL)
     rem = fetch(REM_URL)
+
+    # Load exclusion rules from excluded_jobs.csv
+    excluded_ids = set()
+    try:
+        excl_df = fetch(EXCLUDE_URL)
+        if "id" in excl_df.columns:
+            excluded_ids = set(excl_df["id"].dropna().str.strip())
+            excluded_ids.discard("")
+    except Exception:
+        pass  # exclusions are optional — proceed without them
+
+    def apply_exclusions(df):
+        return df[~df["id"].isin(excluded_ids)].reset_index(drop=True)
+
+    nyc = apply_exclusions(nyc)
+    rem = apply_exclusions(rem)
 
     for df, label in [(nyc, "NYC"), (rem, "Remote")]:
         df["dataset"] = label
@@ -115,8 +174,23 @@ def load_data():
         df["first_seen_date"] = pd.to_datetime(df["first_seen_date"], utc=True, errors="coerce")
         df["first_seen_month"] = df["first_seen_date"].dt.to_period("M").astype(str)
         df["first_seen_year"]  = df["first_seen_date"].dt.year
-        # Parse date_posted (MM/DD/YYYY)
-        df["date_posted_dt"] = pd.to_datetime(df["date_posted"], format="%m/%d/%Y", errors="coerce")
+        # Parse date_posted — handles Unix timestamps (seconds) and MM/DD/YYYY strings
+        def parse_date_posted(series):
+            results = []
+            for val in series:
+                if pd.isna(val):
+                    results.append(pd.NaT)
+                    continue
+                s = str(val).strip()
+                if s.isdigit() and len(s) >= 9:
+                    results.append(pd.Timestamp(int(s), unit="s", tz="UTC"))
+                else:
+                    try:
+                        results.append(pd.Timestamp(datetime.strptime(s, "%m/%d/%Y")).tz_localize("UTC"))
+                    except Exception:
+                        results.append(pd.NaT)
+            return pd.Series(pd.to_datetime(results, utc=True, errors="coerce"))
+        df["date_posted_dt"] = parse_date_posted(df["date_posted"]).values
         df["post_month"]     = df["date_posted_dt"].dt.month
         df["post_month_name"]= df["date_posted_dt"].dt.strftime("%B")
         df["title"]          = df["title"].str.strip()
@@ -135,6 +209,12 @@ def apply_filters(df, exclude_flags):
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 nyc_raw, rem_raw = load_data()
+
+# ── Clear stale season widget state so defaults always reflect current year ──
+_current_year = datetime.now().year
+for _k in list(st.session_state.keys()):
+    if _k.startswith("ts_seasons") and _k != f"ts_seasons_{_current_year}":
+        del st.session_state[_k]
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -181,7 +261,7 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.button("🔄 Refresh data now", use_container_width=True):
+    if st.button("🔄 Refresh data now", width='stretch'):
         st.cache_data.clear()
         st.rerun()
     st.caption(f"Auto-refreshes every hour · Last load: {datetime.now().strftime('%H:%M:%S')}")
@@ -234,8 +314,9 @@ c5.metric("Unique Titles",    f"{combined['title'].nunique():,}")
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_trend, tab_companies, tab_titles, tab_seasons, tab_cleaner = st.tabs([
+tab_trend, tab_timeseries, tab_companies, tab_titles, tab_seasons, tab_cleaner = st.tabs([
     "📈 Trends Over Time",
+    "📊 Season Time Series",
     "🏢 Companies",
     "🔤 Job Titles",
     "📅 Seasons",
@@ -271,33 +352,301 @@ with tab_trend:
         yaxis=dict(gridcolor="#1e1e2e"),
         margin=dict(l=0, r=0, t=20, b=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
-    # Cumulative
-    st.markdown("### Cumulative postings over time")
-    nyc_cum = nyc.groupby("first_seen_month").size().cumsum().reset_index(name="count")
-    nyc_cum["dataset"] = "NYC"
-    rem_cum = rem.groupby("first_seen_month").size().cumsum().reset_index(name="count")
-    rem_cum["dataset"] = "Remote"
-    cum = pd.concat([nyc_cum, rem_cum])
 
-    fig2 = px.line(
-        cum, x="first_seen_month", y="count", color="dataset",
-        color_discrete_map={"NYC": NYC_COLOR, "Remote": REMOTE_COLOR},
-        labels={"first_seen_month": "", "count": "Cumulative postings", "dataset": ""},
-        height=320,
-    )
-    fig2.update_traces(line_width=2.5)
-    fig2.update_layout(
-        plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
-        font_color="#e2e8f0", font_family="DM Mono",
-        legend=dict(orientation="h", y=1.1),
-        xaxis=dict(tickangle=-45, gridcolor="#1e1e2e"),
-        yaxis=dict(gridcolor="#1e1e2e"),
-        margin=dict(l=0, r=0, t=20, b=0),
-    )
-    st.plotly_chart(fig2, use_container_width=True)
 
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SEASON TIME SERIES
+# ════════════════════════════════════════════════════════════════════════════
+with tab_timeseries:
+    st.markdown("### When do companies first post jobs?")
+    st.caption("Each point = new job postings first appearing in the repo that period, by recruiting season")
+
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 1])
+
+    with col_ctrl1:
+        current_year = datetime.now().year
+        # Build season list — cap at current_year to exclude future seasons
+        # outliers that come from multi-season postings (e.g. "Summer 2028")
+        all_flat_seasons = sorted(set(
+            s.strip()
+            for row in combined["recruiting_season"].dropna()
+            for s in str(row).split("|")
+            if s.strip() and s.strip() not in ("N/A", "nan")
+        ), key=lambda s: (
+            int(s.split()[-1]) if s.split()[-1].isdigit() else 9999,
+            ["Summer","Fall","Winter","Spring"].index(s.split()[0])
+            if s.split()[0] in ["Summer","Fall","Winter","Spring"] else 99
+        ))
+        # Default: Summer current_year + Summer next_year (e.g. Summer 2026, Summer 2027)
+        target = {f"Summer {current_year}", f"Summer {current_year + 1}"}
+        default_ts = [s for s in all_flat_seasons if s in target]
+        if not default_ts:
+            default_ts = all_flat_seasons[-2:] if len(all_flat_seasons) >= 2 else all_flat_seasons
+        ts_seasons = st.multiselect(
+            "Recruiting seasons to display",
+            options=all_flat_seasons,
+            default=default_ts,
+            key=f"ts_seasons_{current_year}",
+        )
+
+    with col_ctrl2:
+        ts_dataset = st.radio(
+            "Dataset",
+            ["NYC + Remote", "NYC only", "Remote only"],
+            horizontal=True,
+            key="ts_dataset",
+        )
+
+    with col_ctrl3:
+        ts_granularity = st.radio("Granularity", ["Weekly", "Monthly"], key="ts_granularity")
+        show_total = st.checkbox("Show total line", value=True, key="ts_show_total")
+
+    if not ts_seasons:
+        st.info("Select at least one recruiting season above.")
+    else:
+        if ts_dataset == "NYC only":
+            df_ts_src = nyc.copy()
+        elif ts_dataset == "Remote only":
+            df_ts_src = rem.copy()
+        else:
+            df_ts_src = combined.copy()
+
+        TOTAL_LABEL = "── Total (all seasons) ──"
+
+        # Per-season rows: one entry per job x season pair
+        rows_ts = []
+        for _, row in df_ts_src.iterrows():
+            for s in str(row["recruiting_season"]).split("|"):
+                s = s.strip()
+                if s and s not in ("N/A", "nan") and s in ts_seasons:
+                    rows_ts.append({"season": s, "first_seen_date": row["first_seen_date"]})
+
+        # Total line: every unique job regardless of season (matches Trends tab)
+        rows_total = [
+            {"season": TOTAL_LABEL, "first_seen_date": row["first_seen_date"]}
+            for _, row in df_ts_src.iterrows()
+        ]
+
+        all_rows = rows_ts + (rows_total if show_total else [])
+
+        if not all_rows:
+            st.warning("No data found for the selected seasons and dataset.")
+        else:
+            st.caption(
+                "Each season line counts jobs whose recruiting season includes that label. "
+                "The **Total** line counts every unique job regardless of season — matching the Trends tab exactly."
+            )
+
+            df_ts = pd.DataFrame(all_rows)
+            df_ts["first_seen_date"] = pd.to_datetime(df_ts["first_seen_date"], utc=True, errors="coerce")
+            df_ts = df_ts.dropna(subset=["first_seen_date"])
+
+            if ts_granularity == "Weekly":
+                df_ts["period"] = df_ts["first_seen_date"].dt.to_period("W").apply(lambda p: p.start_time)
+                fill_freq = "W-MON"
+                tick_fmt  = "%b %d, %Y"
+            else:
+                df_ts["period"] = df_ts["first_seen_date"].dt.to_period("M").apply(lambda p: p.start_time)
+                fill_freq = "MS"
+                tick_fmt  = "%b %Y"
+
+            all_season_labels = ts_seasons + ([TOTAL_LABEL] if show_total else [])
+
+            weekly = (
+                df_ts.groupby(["period", "season"])
+                .size()
+                .reset_index(name="count")
+            )
+
+            all_periods = pd.date_range(
+                start=weekly["period"].min(),
+                end=weekly["period"].max(),
+                freq=fill_freq,
+            )
+            idx = pd.MultiIndex.from_product([all_periods, all_season_labels], names=["period", "season"])
+            weekly = (
+                weekly.set_index(["period", "season"])
+                .reindex(idx, fill_value=0)
+                .reset_index()
+            )
+            weekly["week"] = pd.to_datetime(weekly["period"])
+
+            season_order_ts = sorted(
+                ts_seasons,
+                key=lambda s: (
+                    int(s.split()[-1]) if s.split()[-1].isdigit() else 9999,
+                    ["Summer","Fall","Winter","Spring"].index(s.split()[0])
+                    if s.split()[0] in ["Summer","Fall","Winter","Spring"] else 99
+                )
+            ) + ([TOTAL_LABEL] if show_total else [])
+
+            color_seq = px.colors.qualitative.Bold
+            color_map = {s: color_seq[i % len(color_seq)] for i, s in enumerate(ts_seasons)}
+            if show_total:
+                color_map[TOTAL_LABEL] = "#94a3b8"
+
+            fig_ts = px.line(
+                weekly,
+                x="week",
+                y="count",
+                color="season",
+                category_orders={"season": season_order_ts},
+                color_discrete_map=color_map,
+                labels={"week": "", "count": "New postings", "season": "Season"},
+                height=460,
+            )
+            fig_ts.update_traces(line_width=2.5, mode="lines+markers", marker_size=4)
+            for trace in fig_ts.data:
+                if TOTAL_LABEL in trace.name:
+                    trace.line.dash = "dot"
+                    trace.line.width = 2
+                    trace.marker.size = 3
+            fig_ts.update_layout(
+                plot_bgcolor="#0a0a0f",
+                paper_bgcolor="#0a0a0f",
+                font_color="#e2e8f0",
+                font_family="DM Mono",
+                legend=dict(orientation="h", y=-0.18, x=0, font_size=11),
+                xaxis=dict(gridcolor="#1e1e2e", tickformat=tick_fmt, tickangle=-30),
+                yaxis=dict(gridcolor="#1e1e2e"),
+                margin=dict(l=0, r=0, t=30, b=80),
+                hovermode="x unified",
+            )
+
+            selected = st.plotly_chart(
+                fig_ts,
+                width='stretch',
+                on_select="rerun",
+                key="ts_chart",
+            )
+
+            # ── Peak period table ─────────────────────────────────────────
+            st.markdown("#### Peak posting period per season")
+            peak_df = weekly[weekly["season"] != TOTAL_LABEL]
+            if not peak_df.empty:
+                peak = (
+                    peak_df.loc[peak_df.groupby("season")["count"].idxmax()]
+                    [["season", "week", "count"]]
+                    .rename(columns={"season": "Season", "week": "Peak Period", "count": "Postings"})
+                    .sort_values("Season")
+                    .reset_index(drop=True)
+                )
+                peak["Peak Period"] = peak["Peak Period"].dt.strftime(tick_fmt)
+                st.dataframe(peak, width='stretch', hide_index=True)
+
+            # ── Drill-down ────────────────────────────────────────────────
+            st.markdown("#### Drill-down: jobs posted in a period")
+            st.caption("Click a point on the chart, or pick a date in the calendar below")
+
+            # Derive date bounds from date_posted_dt (when companies actually posted)
+            valid_posted = df_ts_src["date_posted_dt"].dropna()
+            min_date = valid_posted.min().date()
+            max_date = valid_posted.max().date()
+
+            # Parse clicked point from chart and push into session_state
+            # so the calendar widget reflects it on the next rerun
+            if selected and selected.get("selection") and selected["selection"].get("points"):
+                pt = selected["selection"]["points"][0]
+                raw_x = pt.get("x", "")
+                if raw_x:
+                    try:
+                        clicked = pd.to_datetime(raw_x).date()
+                        # Clamp to valid range
+                        clicked = max(min_date, min(max_date, clicked))
+                        st.session_state["drill_date"] = clicked
+                    except Exception:
+                        pass
+
+            drill_col1, drill_col2 = st.columns([2, 3])
+            with drill_col1:
+                # date_input reads from session_state["drill_date"] if set
+                drill_date = st.date_input(
+                    "Pick a date",
+                    value=st.session_state.get("drill_date", min_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                    key="drill_date",
+                    label_visibility="collapsed",
+                )
+                if st.session_state.get("drill_date"):
+                    st.caption("📍 Synced from chart click")
+            with drill_col2:
+                drill_season = st.multiselect(
+                    "Filter by season",
+                    options=ts_seasons,
+                    default=[],
+                    key="drill_season",
+                    placeholder="All selected seasons",
+                    label_visibility="collapsed",
+                )
+
+            # Filter source data by date_posted_dt (when the company actually posted)
+            drill_src = df_ts_src.copy()
+            # Normalize date_posted_dt to timezone-naive for safe comparison
+            posted = drill_src["date_posted_dt"]
+            if hasattr(posted.dtype, "tz") and posted.dtype.tz is not None:
+                posted = posted.dt.tz_localize(None)
+            drill_src["_posted_naive"] = posted
+
+            drill_date_ts = pd.Timestamp(drill_date)  # timezone-naive
+
+            if ts_granularity == "Weekly":
+                week_start = drill_date_ts - pd.Timedelta(days=drill_date_ts.weekday())
+                week_end   = week_start + pd.Timedelta(days=6)
+                drill_result = drill_src[
+                    (drill_src["_posted_naive"] >= week_start) &
+                    (drill_src["_posted_naive"] <= week_end)
+                ].copy()
+                period_label = f"week of {week_start.strftime('%b %d, %Y')}"
+            else:
+                drill_result = drill_src[
+                    (drill_src["_posted_naive"].dt.year  == drill_date_ts.year) &
+                    (drill_src["_posted_naive"].dt.month == drill_date_ts.month)
+                ].copy()
+                period_label = drill_date_ts.strftime("%B %Y")
+
+            if drill_season:
+                drill_result = drill_result[
+                    drill_result["recruiting_season"].apply(
+                        lambda x: any(s in str(x) for s in drill_season)
+                    )
+                ]
+
+            drill_result = drill_result.sort_values(["company_name", "title"])
+
+            if drill_result.empty:
+                st.info(f"No jobs found for {period_label}.")
+            else:
+                st.caption(f"**{len(drill_result):,} jobs** posted during {period_label}")
+                show_drill_cols = ["company_name", "title", "recruiting_season", "url"]
+                available = [c for c in show_drill_cols if c in drill_result.columns]
+                st.dataframe(
+                    drill_result[available]
+                    .rename(columns={
+                        "company_name": "Company",
+                        "title": "Title",
+                        "recruiting_season": "Season",
+                        "url": "URL",
+                    })
+                    .reset_index(drop=True),
+                    width='stretch',
+                    height=min(400, 40 + len(drill_result) * 35),
+                )
+
+            with st.expander("Show full data table"):
+                pivot = (
+                    weekly.pivot(index="week", columns="season", values="count")
+                    .fillna(0).astype(int)
+                    .sort_index(ascending=False)
+                    .reset_index()
+                )
+                pivot["week"] = pivot["week"].dt.strftime(tick_fmt)
+                pivot = pivot.rename(columns={"week": "Period"})
+                st.dataframe(pivot, width='stretch', hide_index=True)
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 2 — COMPANIES
@@ -340,7 +689,7 @@ with tab_companies:
             margin=dict(l=0, r=0, t=10, b=0),
             showlegend=False,
         )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
     with col_r:
         st.markdown("### Average posting month by company")
@@ -363,7 +712,7 @@ with tab_companies:
             avg_month[["company_name", "month_name", "total"]]
             .rename(columns={"company_name": "Company", "month_name": "Avg Post Month", "total": "# Postings"})
             .reset_index(drop=True),
-            use_container_width=True,
+            width='stretch',
             height=500,
         )
 
@@ -403,7 +752,7 @@ with tab_titles:
             margin=dict(l=0, r=0, t=10, b=0),
             showlegend=False,
         )
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width='stretch')
 
     with col_b:
         st.markdown("#### Title category breakdown")
@@ -442,7 +791,7 @@ with tab_titles:
             showlegend=False,
             margin=dict(l=0, r=0, t=10, b=0),
         )
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(fig5, width='stretch')
 
     st.markdown("#### All titles — searchable table")
     search = st.text_input("Search titles", placeholder="e.g. machine learning, quant, design")
@@ -458,7 +807,7 @@ with tab_titles:
             "recruiting_season": "Season", "dataset": "Type",
             "first_seen_date": "First Seen",
         }).reset_index(drop=True),
-        use_container_width=True,
+        width='stretch',
         height=400,
     )
     st.caption(f"{len(df_titles_all):,} rows shown")
@@ -503,19 +852,19 @@ with tab_seasons:
         yaxis=dict(gridcolor="#1e1e2e"),
         margin=dict(l=0, r=0, t=20, b=0),
     )
-    st.plotly_chart(fig6, use_container_width=True)
+    st.plotly_chart(fig6, width='stretch')
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### NYC seasons")
         nyc_s = expand_seasons(nyc)["season"].value_counts().reset_index()
         nyc_s.columns = ["Season", "Postings"]
-        st.dataframe(nyc_s, use_container_width=True, height=300)
+        st.dataframe(nyc_s, width='stretch', height=300)
     with col2:
         st.markdown("#### Remote seasons")
         rem_s = expand_seasons(rem)["season"].value_counts().reset_index()
         rem_s.columns = ["Season", "Postings"]
-        st.dataframe(rem_s, use_container_width=True, height=300)
+        st.dataframe(rem_s, width='stretch', height=300)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -552,7 +901,7 @@ with tab_cleaner:
             "recruiting_season": "Season", "date_posted": "Posted",
             "first_seen_date": "First Seen", "url": "URL", "id": "ID",
         }).reset_index(drop=True),
-        use_container_width=True,
+        width='stretch',
         height=500,
     )
     st.caption(f"{len(df_display):,} rows · use sidebar filters to clean")
@@ -565,7 +914,7 @@ with tab_cleaner:
             data=nyc.drop(columns=["first_seen_month","first_seen_year","date_posted_dt","post_month","post_month_name","dataset"], errors="ignore").to_csv(index=False),
             file_name="nyc_jobs_filtered.csv",
             mime="text/csv",
-            use_container_width=True,
+            width='stretch',
         )
     with col_dl2:
         st.download_button(
@@ -573,5 +922,5 @@ with tab_cleaner:
             data=rem.drop(columns=["first_seen_month","first_seen_year","date_posted_dt","post_month","post_month_name","dataset"], errors="ignore").to_csv(index=False),
             file_name="remote_jobs_filtered.csv",
             mime="text/csv",
-            use_container_width=True,
-        )
+            width='stretch',
+        )                                                                                   
