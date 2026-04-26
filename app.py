@@ -923,4 +923,4 @@ with tab_cleaner:
             file_name="remote_jobs_filtered.csv",
             mime="text/csv",
             width='stretch',
-        )                                                                                   
+        )
