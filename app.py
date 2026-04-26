@@ -557,39 +557,36 @@ with tab_timeseries:
             min_date    = bound_dates.min().date()
             max_date    = bound_dates.max().date()
 
-            # Parse clicked point — store in a separate key so it doesn't
-            # conflict with the date_input widget's own state management
+            # Chart click — only update the calendar when the user clicks a
+            # genuinely new point. Compare against last seen selection to avoid
+            # overwriting manual calendar picks on every rerun.
+            chart_clicked_date = None
             if selected and selected.get("selection") and selected["selection"].get("points"):
                 pt = selected["selection"]["points"][0]
                 raw_x = pt.get("x", "")
                 if raw_x:
                     try:
-                        clicked = pd.to_datetime(raw_x).date()
-                        clicked = max(min_date, min(max_date, clicked))
-                        # Only update if different from current value to avoid
-                        # infinite rerun loops
-                        if st.session_state.get("drill_date_clicked") != clicked:
-                            st.session_state["drill_date_clicked"] = clicked
-                            st.session_state["drill_date_value"]   = clicked
+                        chart_clicked_date = pd.to_datetime(raw_x).date()
+                        chart_clicked_date = max(min_date, min(max_date, chart_clicked_date))
+                        last_chart_click = st.session_state.get("drill_last_chart_click")
+                        if chart_clicked_date != last_chart_click:
+                            # Genuinely new click — update both tracking keys
+                            st.session_state["drill_last_chart_click"] = chart_clicked_date
+                            st.session_state["drill_date_input"]       = chart_clicked_date
                     except Exception:
                         pass
-
-            # Use separate value state — lets the user also change it freely
-            # without fighting the chart click
-            current_drill_date = st.session_state.get("drill_date_value", min_date)
 
             drill_col1, drill_col2 = st.columns([2, 3])
             with drill_col1:
                 drill_date = st.date_input(
                     "Pick a date",
-                    value=current_drill_date,
+                    value=st.session_state.get("drill_date_input", min_date),
                     min_value=min_date,
                     max_value=max_date,
+                    key="drill_date_input",
                     label_visibility="collapsed",
                 )
-                # Write user's manual selection back to state
-                st.session_state["drill_date_value"] = drill_date
-                if st.session_state.get("drill_date_clicked") == drill_date:
+                if chart_clicked_date:
                     st.caption("📍 Synced from chart click")
             with drill_col2:
                 drill_season = st.multiselect(
@@ -640,7 +637,9 @@ with tab_timeseries:
                     )
                 ]
 
-            drill_result = drill_result.sort_values(["company_name", "title"])
+            # Sort safely — empty result or missing columns won't crash
+            if not drill_result.empty and "company_name" in drill_result.columns:
+                drill_result = drill_result.sort_values(["company_name", "title"])
 
             if drill_result.empty:
                 st.info(f"No jobs found for {period_label}.")
@@ -739,6 +738,105 @@ with tab_companies:
             width='stretch',
             height=500,
         )
+
+
+# ── Company drill-down ───────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Company historical drill-down")
+    st.caption("Select a company to see when they posted jobs over time")
+
+    all_companies = sorted(combined["company_name"].dropna().unique())
+    co_search = st.text_input("Search company", placeholder="e.g. Goldman, Meta, Uber", key="co_drill_search")
+
+    filtered_cos = [c for c in all_companies if co_search.lower() in c.lower()] if co_search.strip() else all_companies
+    if not filtered_cos:
+        st.info("No companies match your search.")
+    else:
+        selected_co = st.selectbox(
+            "Select company",
+            options=filtered_cos,
+            key="co_drill_select",
+            label_visibility="collapsed",
+        )
+
+        co_nyc = nyc[nyc["company_name"] == selected_co].copy()
+        co_rem = rem[rem["company_name"] == selected_co].copy()
+        co_all = pd.concat([co_nyc, co_rem], ignore_index=True)
+
+        if co_all.empty:
+            st.info(f"No jobs found for {selected_co}.")
+        else:
+            co_all["first_seen_date"] = pd.to_datetime(co_all["first_seen_date"], utc=True, errors="coerce")
+            co_all["first_seen_naive"] = co_all["first_seen_date"].dt.tz_convert(None)
+            co_all["month"] = co_all["first_seen_naive"].dt.to_period("M").apply(lambda p: p.start_time)
+            co_all["year"]  = co_all["first_seen_naive"].dt.year
+
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.metric("Total postings",  len(co_all))
+            kc2.metric("NYC postings",    len(co_nyc))
+            kc3.metric("Remote postings", len(co_rem))
+
+            # Monthly posting timeline
+            co_monthly = co_all.groupby(["month","dataset"]).size().reset_index(name="count")
+            fig_co = px.bar(
+                co_monthly, x="month", y="count", color="dataset",
+                color_discrete_map={"NYC": NYC_COLOR, "Remote": REMOTE_COLOR},
+                barmode="stack",
+                labels={"month": "", "count": "Postings", "dataset": ""},
+                height=300,
+                title=f"{selected_co} — monthly postings",
+            )
+            fig_co.update_layout(
+                plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
+                font_color="#e2e8f0", font_family="DM Mono",
+                legend=dict(orientation="h", y=1.15),
+                xaxis=dict(gridcolor="#1e1e2e", tickformat="%b %Y", tickangle=-45),
+                yaxis=dict(gridcolor="#1e1e2e"),
+                margin=dict(l=0, r=0, t=40, b=0),
+                title_font=dict(family="Syne", size=14),
+            )
+            st.plotly_chart(fig_co, width='stretch')
+
+            # Which month of year they tend to post
+            co_all["month_of_year"] = co_all["first_seen_naive"].dt.month
+            month_counts = co_all.groupby("month_of_year").size().reset_index(name="count")
+            month_counts["month_name"] = month_counts["month_of_year"].apply(
+                lambda m: datetime(2000, m, 1).strftime("%B")
+            )
+            fig_moy = px.bar(
+                month_counts, x="month_name", y="count",
+                color_discrete_sequence=[NYC_COLOR],
+                labels={"month_name": "", "count": "Postings"},
+                height=240,
+                title="Which month of year they typically post",
+                category_orders={"month_name": [datetime(2000,m,1).strftime("%B") for m in range(1,13)]},
+            )
+            fig_moy.update_layout(
+                plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
+                font_color="#e2e8f0", font_family="DM Mono",
+                xaxis=dict(gridcolor="#1e1e2e"),
+                yaxis=dict(gridcolor="#1e1e2e"),
+                margin=dict(l=0, r=0, t=40, b=0),
+                showlegend=False,
+                title_font=dict(family="Syne", size=14),
+            )
+            st.plotly_chart(fig_moy, width='stretch')
+
+            # All postings table
+            with st.expander(f"All {selected_co} postings ({len(co_all)})"):
+                display_co = co_all[["company_name","title","recruiting_season","first_seen_date","dataset","url"]].copy()
+                display_co["first_seen_date"] = display_co["first_seen_date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    display_co.sort_values("first_seen_date", ascending=False)
+                    .rename(columns={
+                        "company_name": "Company", "title": "Title",
+                        "recruiting_season": "Season", "first_seen_date": "First Seen",
+                        "dataset": "Type", "url": "URL",
+                    })
+                    .reset_index(drop=True),
+                    width='stretch',
+                    height=min(400, 40 + len(co_all) * 35),
+                )
 
 
 # ════════════════════════════════════════════════════════════════════════════
