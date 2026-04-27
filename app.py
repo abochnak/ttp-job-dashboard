@@ -768,62 +768,144 @@ with tab_companies:
         else:
             co_all["first_seen_date"] = pd.to_datetime(co_all["first_seen_date"], utc=True, errors="coerce")
             co_all["first_seen_naive"] = co_all["first_seen_date"].dt.tz_convert(None)
-            co_all["month"] = co_all["first_seen_naive"].dt.to_period("M").apply(lambda p: p.start_time)
-            co_all["year"]  = co_all["first_seen_naive"].dt.year
+            co_all["month_of_year"] = co_all["first_seen_naive"].dt.month
+            co_all["month_name"]    = co_all["first_seen_naive"].dt.strftime("%b")
+            co_all["year_str"]      = co_all["first_seen_naive"].dt.year.astype(str)
+            co_all["day_of_month"]  = co_all["first_seen_naive"].dt.day
 
-            kc1, kc2, kc3 = st.columns(3)
+            kc1, kc2, kc3, kc4 = st.columns(4)
             kc1.metric("Total postings",  len(co_all))
             kc2.metric("NYC postings",    len(co_nyc))
             kc3.metric("Remote postings", len(co_rem))
 
-            # Monthly posting timeline
-            co_monthly = co_all.groupby(["month","dataset"]).size().reset_index(name="count")
-            fig_co = px.bar(
-                co_monthly, x="month", y="count", color="dataset",
-                color_discrete_map={"NYC": NYC_COLOR, "Remote": REMOTE_COLOR},
-                barmode="stack",
-                labels={"month": "", "count": "Postings", "dataset": ""},
-                height=300,
-                title=f"{selected_co} — monthly postings",
+            # ── Season term filter ────────────────────────────────────────────
+            co_term_filter = st.radio(
+                "Filter by season type",
+                ["Summer", "Fall", "Spring", "Winter", "All"],
+                horizontal=True,
+                index=0,   # Summer by default
+                key="co_term_filter",
             )
-            fig_co.update_layout(
+
+            # Apply filter: keep jobs whose recruiting season includes the selected term
+            if co_term_filter != "All":
+                co_filtered = co_all[
+                    co_all["recruiting_season"].str.contains(co_term_filter, case=False, na=False)
+                ].copy()
+            else:
+                co_filtered = co_all.copy()
+
+            kc4.metric(f"{co_term_filter} postings", len(co_filtered))
+
+            # ── Most common recruitment month ─────────────────────────────────
+            if not co_filtered.empty:
+                month_freq    = co_filtered["month_of_year"].value_counts()
+                top_month_num = month_freq.idxmax()
+                top_month_name = [
+                    "January","February","March","April","May","June",
+                    "July","August","September","October","November","December"
+                ][top_month_num - 1]
+                top_count  = month_freq.max()
+                pct        = top_count / len(co_filtered) * 100
+                st.info(
+                    f"Most common recruitment month for **{co_term_filter}** roles: "
+                    f"**{top_month_name}** — {top_count} of {len(co_filtered)} postings ({pct:.0f}%)"
+                )
+            else:
+                st.info(f"No {co_term_filter} postings found for {selected_co}.")
+
+            # ── Scatter plot: each dot = one posting, x = Jan–Dec, color = year ──
+            import numpy as np
+            # Sort by exact date so within each month dots go left=earlier, right=later
+            co_filtered = co_filtered.sort_values("first_seen_naive").reset_index(drop=True)
+
+            # Position within month based on day (1→-0.35, 31→+0.35)
+            co_filtered["x_jitter"] = co_filtered["month_of_year"] + (
+                (co_filtered["day_of_month"] - 1) / 30 * 0.7 - 0.35
+            )
+            # Add tiny random nudge on y so stacked dots on the same day spread out visually
+            rng = np.random.default_rng(42)
+            co_filtered["y_jitter"] = rng.uniform(-0.15, 0.15, len(co_filtered))
+
+            MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+            # Extract recruiting year from season field (earliest year if multi-season)
+            def recruiting_year(season_str):
+                years_found = re.findall(r'\b(20\d{2})\b', str(season_str))
+                return min(years_found) if years_found else "unknown"
+
+            import re as _re
+            co_filtered["recruiting_year"] = co_filtered["recruiting_season"].apply(
+                lambda s: min(_re.findall(r'\b(20\d{2})\b', str(s)), default=None)
+            ).fillna(co_filtered["year_str"])
+
+            # Assign a distinct color per recruiting year
+            rec_years = sorted(co_filtered["recruiting_year"].unique())
+            year_colors = px.colors.qualitative.Bold[:len(rec_years)]
+            year_color_map = {yr: year_colors[i % len(year_colors)] for i, yr in enumerate(rec_years)}
+
+            fig_scatter = go.Figure()
+
+            for yr in rec_years:
+                yr_data = co_filtered[co_filtered["recruiting_year"] == yr]
+                fig_scatter.add_trace(go.Scatter(
+                    x=yr_data["x_jitter"],
+                    y=yr_data["y_jitter"].tolist(),
+                    mode="markers",
+                    name=yr,
+                    marker=dict(
+                        size=14,
+                        color=year_color_map[yr],
+                        opacity=0.9,
+                        line=dict(width=1, color="#0a0a0f"),
+                    ),
+                    text=yr_data.apply(
+                        lambda r: (
+                            f"<b>{r['title']}</b><br>"
+                            f"Posted: {r['month_name']} {r['day_of_month']}, {r['year_str']}<br>"
+                            f"Recruiting for: {r['recruiting_season']}<br>"
+                            f"Type: {r['dataset']}"
+                        ),
+                        axis=1,
+                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                ))
+
+            fig_scatter.update_layout(
                 plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
                 font_color="#e2e8f0", font_family="DM Mono",
-                legend=dict(orientation="h", y=1.15),
-                xaxis=dict(gridcolor="#1e1e2e", tickformat="%b %Y", tickangle=-45),
-                yaxis=dict(gridcolor="#1e1e2e"),
-                margin=dict(l=0, r=0, t=40, b=0),
-                title_font=dict(family="Syne", size=14),
+                title=dict(
+                    text=f"{selected_co} — posting dates by month (each dot = one job, color = recruiting year)",
+                    font=dict(family="Syne", size=13),
+                ),
+                xaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(1, 13)),
+                    ticktext=MONTH_NAMES,
+                    range=[0.5, 12.5],
+                    gridcolor="#1e1e2e",
+                    title="",
+                ),
+                yaxis=dict(
+                    gridcolor="rgba(0,0,0,0)",
+                    zerolinecolor="rgba(0,0,0,0)",
+                    title="",
+                    showticklabels=False,
+                    range=[-0.6, 0.6],
+                ),
+                legend=dict(
+                    orientation="h", y=1.18, x=0,
+                    title_text="Year  ",
+                    font=dict(size=12),
+                ),
+                margin=dict(l=0, r=0, t=60, b=10),
+                height=220,
+                hovermode="closest",
             )
-            st.plotly_chart(fig_co, width='stretch')
+            st.plotly_chart(fig_scatter, width='stretch')
 
-            # Which month of year they tend to post
-            co_all["month_of_year"] = co_all["first_seen_naive"].dt.month
-            month_counts = co_all.groupby("month_of_year").size().reset_index(name="count")
-            month_counts["month_name"] = month_counts["month_of_year"].apply(
-                lambda m: datetime(2000, m, 1).strftime("%B")
-            )
-            fig_moy = px.bar(
-                month_counts, x="month_name", y="count",
-                color_discrete_sequence=[NYC_COLOR],
-                labels={"month_name": "", "count": "Postings"},
-                height=240,
-                title="Which month of year they typically post",
-                category_orders={"month_name": [datetime(2000,m,1).strftime("%B") for m in range(1,13)]},
-            )
-            fig_moy.update_layout(
-                plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
-                font_color="#e2e8f0", font_family="DM Mono",
-                xaxis=dict(gridcolor="#1e1e2e"),
-                yaxis=dict(gridcolor="#1e1e2e"),
-                margin=dict(l=0, r=0, t=40, b=0),
-                showlegend=False,
-                title_font=dict(family="Syne", size=14),
-            )
-            st.plotly_chart(fig_moy, width='stretch')
-
-            # All postings table
-            with st.expander(f"All {selected_co} postings ({len(co_all)})"):
+            # All postings table — always shows full unfiltered list, newest first
+            with st.expander(f"All {selected_co} postings ({len(co_all)}) — sorted most recent first"):
                 display_co = co_all[["company_name","title","recruiting_season","first_seen_date","dataset","url"]].copy()
                 display_co["first_seen_date"] = display_co["first_seen_date"].dt.strftime("%Y-%m-%d")
                 st.dataframe(
@@ -839,9 +921,124 @@ with tab_companies:
                 )
 
 
-# ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — JOB TITLES
 # ════════════════════════════════════════════════════════════════════════════
+
+# ── Apprenticeship programs (added to bottom of companies tab) ────────────
+    st.divider()
+    st.markdown("### Apprenticeship programs")
+    st.caption("Jobs with 'apprentice' or 'apprenticeship' in the title")
+
+    ap_dataset = st.radio(
+        "Dataset",
+        ["NYC + Remote", "NYC only", "Remote only"],
+        horizontal=True,
+        key="ap_dataset",
+    )
+
+    if ap_dataset == "NYC only":
+        ap_src = nyc
+    elif ap_dataset == "Remote only":
+        ap_src = rem
+    else:
+        ap_src = combined
+
+    ap_df = ap_src[
+        ap_src["title"].str.contains("apprentice", case=False, na=False)
+    ].copy()
+
+    if ap_df.empty:
+        st.info("No apprenticeship programs found in the current dataset.")
+    else:
+        ap1, ap2 = st.columns(2)
+        ap1.metric("Total apprenticeship postings", len(ap_df))
+        ap2.metric("Companies offering them", ap_df["company_name"].nunique())
+
+
+        # ── Posting date scatter plot ─────────────────────────────────────
+        st.markdown("#### When apprenticeship programs get posted")
+        st.caption("Each dot = one posting · x-axis = Jan–Dec · color = recruiting year")
+
+        import numpy as _np2
+        ap_df["first_seen_dt"] = pd.to_datetime(ap_df["first_seen_date"], utc=True, errors="coerce").dt.tz_convert(None)
+        ap_df["ap_month"]      = ap_df["first_seen_dt"].dt.month
+        ap_df["ap_day"]        = ap_df["first_seen_dt"].dt.day
+        ap_df["ap_month_name"] = ap_df["first_seen_dt"].dt.strftime("%b")
+        ap_df["ap_year"]       = ap_df["first_seen_dt"].dt.year.astype(str)
+
+        import re as _re2
+        ap_df["ap_rec_year"] = ap_df["recruiting_season"].apply(
+            lambda s: min(_re2.findall(r"(20\d{2})", str(s)), default=None)
+        ).fillna(ap_df["ap_year"])
+
+        ap_df = ap_df.sort_values("first_seen_dt").reset_index(drop=True)
+        ap_df["ap_x"] = ap_df["ap_month"] + ((ap_df["ap_day"] - 1) / 30 * 0.7 - 0.35)
+        rng2 = _np2.random.default_rng(99)
+        ap_df["ap_y"] = rng2.uniform(-0.15, 0.15, len(ap_df))
+
+        MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        ap_rec_years = sorted(ap_df["ap_rec_year"].unique())
+        ap_colors    = px.colors.qualitative.Bold
+        ap_color_map = {yr: ap_colors[i % len(ap_colors)] for i, yr in enumerate(ap_rec_years)}
+
+        fig_ap = go.Figure()
+        for yr in ap_rec_years:
+            yd = ap_df[ap_df["ap_rec_year"] == yr]
+            fig_ap.add_trace(go.Scatter(
+                x=yd["ap_x"],
+                y=yd["ap_y"].tolist(),
+                mode="markers",
+                name=yr,
+                marker=dict(size=12, color=ap_color_map[yr], opacity=0.9, line=dict(width=1, color="#0a0a0f")),
+                text=yd.apply(
+                    lambda r: (
+                        f"<b>{r['company_name']}</b><br>"
+                        f"{r['title']}<br>"
+                        f"Posted: {r['ap_month_name']} {r['ap_day']}, {r['ap_year']}<br>"
+                        f"Recruiting for: {r['recruiting_season']}"
+                    ), axis=1
+                ),
+                hovertemplate="%{text}<extra></extra>",
+            ))
+
+        # Most common posting month
+        top_ap_month = ap_df["ap_month"].value_counts().idxmax()
+        top_ap_name  = MONTH_NAMES[top_ap_month - 1]
+        top_ap_count = ap_df["ap_month"].value_counts().max()
+        st.info(f"Most common posting month: **{top_ap_name}** — {top_ap_count} of {len(ap_df)} postings ({top_ap_count/len(ap_df)*100:.0f}%)")
+
+        fig_ap.update_layout(
+            plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
+            font_color="#e2e8f0", font_family="DM Mono",
+            xaxis=dict(tickmode="array", tickvals=list(range(1,13)), ticktext=MONTH_NAMES, range=[0.5,12.5], gridcolor="#1e1e2e", title=""),
+            yaxis=dict(gridcolor="rgba(0,0,0,0)", zerolinecolor="rgba(0,0,0,0)", showticklabels=False, range=[-0.6, 0.6], title=""),
+            legend=dict(orientation="h", y=1.18, x=0, title_text="Recruiting year  ", font=dict(size=12)),
+            margin=dict(l=0, r=0, t=50, b=10),
+            height=200,
+            hovermode="closest",
+        )
+        st.plotly_chart(fig_ap, width='stretch')
+
+        # Full posting list with dates — no graph needed given small volume
+        ap_display = ap_df[["company_name","title","recruiting_season","first_seen_date","dataset","url"]].copy()
+        ap_display["first_seen_dt"] = pd.to_datetime(ap_display["first_seen_date"], utc=True, errors="coerce")
+        ap_display["First Seen"]    = ap_display["first_seen_dt"].dt.strftime("%b %d, %Y")
+        ap_display["Month Posted"]  = ap_display["first_seen_dt"].dt.strftime("%B")
+        ap_display = ap_display.sort_values("first_seen_dt", ascending=False)
+
+        st.dataframe(
+            ap_display[["company_name","title","recruiting_season","Month Posted","First Seen","dataset","url"]]
+            .rename(columns={
+                "company_name": "Company", "title": "Title",
+                "recruiting_season": "Season", "dataset": "Type", "url": "URL",
+            })
+            .reset_index(drop=True),
+            width='stretch',
+            height=min(600, 40 + len(ap_display) * 38),
+            hide_index=True,
+        )
+
+
 with tab_titles:
     st.markdown("### Title distribution")
 
@@ -944,7 +1141,10 @@ with tab_seasons:
     def expand_seasons(df):
         rows = []
         for _, row in df.iterrows():
-            seasons = [s.strip() for s in str(row["recruiting_season"]).split("|") if s.strip() and s.strip() != "N/A"]
+            seasons = [
+                s.strip() for s in str(row["recruiting_season"]).split("|")
+                if s.strip() and s.strip().lower() not in ("n/a", "nan", "none", "")
+            ]
             for s in seasons:
                 rows.append({"season": s, "dataset": row["dataset"]})
         return pd.DataFrame(rows)
@@ -987,6 +1187,132 @@ with tab_seasons:
         rem_s = expand_seasons(rem)["season"].value_counts().reset_index()
         rem_s.columns = ["Season", "Postings"]
         st.dataframe(rem_s, width='stretch', height=300)
+
+    st.divider()
+    st.markdown("### Companies offering Fall, Winter & Spring co-ops")
+    st.caption("Companies with at least one posting for a non-summer season")
+
+    # Expand all seasons and tag the season type
+    def expand_with_company_s(df):
+        rows = []
+        for _, row in df.iterrows():
+            for s in str(row["recruiting_season"]).split("|"):
+                s = s.strip()
+                if not s or s == "N/A":
+                    continue
+                term = s.split()[0] if s.split() else ""
+                rows.append({
+                    "company_name":     row["company_name"],
+                    "title":            row["title"],
+                    "season":           s,
+                    "term":             term,
+                    "dataset":          row["dataset"],
+                    "first_seen_date":  row["first_seen_date"].strftime("%Y-%m-%d") if hasattr(row["first_seen_date"], "strftime") else str(row["first_seen_date"])[:10],
+                    "url":              row.get("url", ""),
+                })
+        return pd.DataFrame(rows)
+
+    all_expanded_s = expand_with_company_s(combined)
+    coop_terms_s   = ["Fall", "Winter", "Spring"]
+    coop_df_s      = all_expanded_s[all_expanded_s["term"].isin(coop_terms_s)]
+
+    if coop_df_s.empty:
+        st.info("No Fall/Winter/Spring postings found.")
+    else:
+        fc1, fc2, fc3 = st.columns([2, 2, 2])
+        with fc1:
+            coop_term_filter_s = st.multiselect(
+                "Season type",
+                options=coop_terms_s,
+                default=coop_terms_s,
+                key="coop_term_filter_s",
+            )
+        with fc2:
+            coop_dataset_filter_s = st.radio(
+                "Dataset",
+                ["NYC + Remote", "NYC only", "Remote only"],
+                horizontal=True,
+                key="coop_dataset_filter_s",
+            )
+        with fc3:
+            coop_search_co = st.text_input(
+                "Search company",
+                placeholder="e.g. Goldman, Amazon",
+                key="coop_co_search_s",
+            )
+
+        coop_filtered_s = coop_df_s[coop_df_s["term"].isin(coop_term_filter_s)] if coop_term_filter_s else coop_df_s
+        if coop_dataset_filter_s == "NYC only":
+            coop_filtered_s = coop_filtered_s[coop_filtered_s["dataset"] == "NYC"]
+        elif coop_dataset_filter_s == "Remote only":
+            coop_filtered_s = coop_filtered_s[coop_filtered_s["dataset"] == "Remote"]
+        if coop_search_co.strip():
+            coop_filtered_s = coop_filtered_s[
+                coop_filtered_s["company_name"].str.contains(coop_search_co.strip(), case=False, na=False)
+            ]
+
+        co_summary_s = (
+            coop_filtered_s.groupby("company_name")
+            .agg(
+                postings=("title", "count"),
+                seasons=("season", lambda x: " · ".join(sorted(set(x)))),
+                types=("term", lambda x: ", ".join(sorted(set(x)))),
+            )
+            .reset_index()
+            .sort_values("postings", ascending=False)
+            .rename(columns={
+                "company_name": "Company",
+                "postings":     "# Postings",
+                "seasons":      "Seasons Offered",
+                "types":        "Season Types",
+            })
+            .reset_index(drop=True)
+        )
+
+        st.caption(f"{len(co_summary_s):,} companies offer Fall/Winter/Spring co-ops · {len(coop_filtered_s):,} total postings")
+
+        top_coop_s = co_summary_s.head(20)
+        fig_coop_s = px.bar(
+            top_coop_s.iloc[::-1],
+            x="# Postings", y="Company", orientation="h",
+            color_discrete_sequence=["#38bdf8"],
+            labels={"# Postings": "Postings", "Company": ""},
+            height=max(300, min(len(top_coop_s), 20) * 30),
+            title="Top 20 companies by co-op posting volume",
+        )
+        fig_coop_s.update_layout(
+            plot_bgcolor="#0a0a0f", paper_bgcolor="#0a0a0f",
+            font_color="#e2e8f0", font_family="DM Mono",
+            xaxis=dict(gridcolor="#1e1e2e"),
+            yaxis=dict(gridcolor="rgba(0,0,0,0)"),
+            margin=dict(l=0, r=0, t=40, b=0),
+            showlegend=False,
+            title_font=dict(family="Syne", size=13),
+        )
+        st.plotly_chart(fig_coop_s, width='stretch')
+
+        st.dataframe(co_summary_s, width='stretch', height=400, hide_index=True)
+
+        with st.expander("Show all individual co-op postings"):
+            st.dataframe(
+                coop_filtered_s[["company_name","title","season","first_seen_date","dataset","url"]]
+                .sort_values(["company_name","first_seen_date"])
+                .rename(columns={
+                    "company_name":    "Company",
+                    "title":           "Title",
+                    "season":          "Season",
+                    "first_seen_date": "First Seen",
+                    "dataset":         "Type",
+                    "url":             "URL",
+                })
+                .reset_index(drop=True),
+                width='stretch',
+                height=400,
+            )
+
+# ════════════════════════════════════════════════════════════════════════════
+
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
