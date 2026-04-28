@@ -64,7 +64,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-GITHUB_USER = "YOUR_GITHUB_USERNAME"   # ← update this after pushing to GitHub
+GITHUB_USER = "abochnak"   # ← update this after pushing to GitHub
 GITHUB_REPO = "historical-nyc-remote-job-postings"
 BRANCH      = "data"
 
