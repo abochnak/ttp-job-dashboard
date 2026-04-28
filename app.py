@@ -64,7 +64,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-GITHUB_USER = "abochnak"   # ← update this after pushing to GitHub
+GITHUB_USER = "YOUR_GITHUB_USERNAME"   # ← update this after pushing to GitHub
 GITHUB_REPO = "historical-nyc-remote-job-postings"
 BRANCH      = "data"
 
@@ -580,7 +580,7 @@ with tab_timeseries:
             with drill_col1:
                 drill_date = st.date_input(
                     "Pick a date",
-                    value=st.session_state.get("drill_date_input", min_date),
+                    value=st.session_state.get("drill_date_input", datetime.today().date()),
                     min_value=min_date,
                     max_value=max_date,
                     key="drill_date_input",
