@@ -66,7 +66,7 @@ st.markdown("""
 # ── Constants ─────────────────────────────────────────────────────────────────
 GITHUB_USER = "YOUR_GITHUB_USERNAME"   # ← update this after pushing to GitHub
 GITHUB_REPO = "historical-nyc-remote-job-postings"
-BRANCH      = "main"
+BRANCH      = "data"
 
 NYC_URL = (
     f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}"
